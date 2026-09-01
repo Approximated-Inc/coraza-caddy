@@ -597,3 +597,37 @@ func testStreamingFlush(t *testing.T, waf coraza.WAF, streams, numChunks int, co
 		<-gates[i].done
 	}
 }
+
+func TestInterceptor_103EarlyHintsPassesThroughAndFinalStatusSurvives(t *testing.T) {
+	waf, err := coraza.NewWAF(coraza.NewWAFConfig().WithDirectives("SecRuleEngine On\nSecResponseBodyAccess Off"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var sawFinal bool
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		tx := waf.NewTransaction()
+		defer tx.Close()
+		ww, processResponse := wrap(w, r, tx)
+		ww.Header().Set("Link", "</x.css>; rel=preload; as=style")
+		ww.WriteHeader(http.StatusEarlyHints)
+		ww.Header().Set("Location", "/login")
+		ww.WriteHeader(http.StatusTemporaryRedirect)
+		sawFinal = true
+		if err := processResponse(tx, r); err != nil {
+			t.Errorf("processResponse: %v", err)
+		}
+	}))
+	defer srv.Close()
+
+	c := &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+	res, err := c.Get(srv.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !sawFinal || res.StatusCode != http.StatusTemporaryRedirect {
+		t.Fatalf("want 307 after a 103, got %d", res.StatusCode)
+	}
+	if res.Header.Get("Location") != "/login" {
+		t.Fatalf("Location lost: %q", res.Header.Get("Location"))
+	}
+}

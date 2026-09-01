@@ -34,6 +34,14 @@ func (i *rwInterceptor) WriteHeader(statusCode int) {
 		return
 	}
 
+	// 1xx (e.g. 103 Early Hints forwarded by reverse_proxy) is informational:
+	// forward it now and keep waiting for the final status, which is the one
+	// phase-3 rules must inspect.
+	if 100 <= statusCode && statusCode <= 199 {
+		i.w.WriteHeader(statusCode)
+		return
+	}
+
 	for k, vv := range i.w.Header() {
 		for _, v := range vv {
 			i.tx.AddResponseHeader(k, v)
