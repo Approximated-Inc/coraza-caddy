@@ -36,8 +36,9 @@ func (i *rwInterceptor) WriteHeader(statusCode int) {
 
 	// 1xx (e.g. 103 Early Hints forwarded by reverse_proxy) is informational:
 	// forward it now and keep waiting for the final status, which is the one
-	// phase-3 rules must inspect.
-	if 100 <= statusCode && statusCode <= 199 {
+	// phase-3 rules must inspect. 101 is excluded: it is the final status of an
+	// upgraded connection, so it keeps taking the regular path.
+	if 100 <= statusCode && statusCode <= 199 && statusCode != http.StatusSwitchingProtocols {
 		i.w.WriteHeader(statusCode)
 		return
 	}

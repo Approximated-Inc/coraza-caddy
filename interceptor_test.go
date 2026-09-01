@@ -5,11 +5,14 @@ package coraza
 
 import (
 	"bufio"
+	"context"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/http/httptrace"
+	"net/textproto"
 	"strings"
 	"sync"
 	"testing"
@@ -620,14 +623,48 @@ func TestInterceptor_103EarlyHintsPassesThroughAndFinalStatusSurvives(t *testing
 	defer srv.Close()
 
 	c := &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
-	res, err := c.Get(srv.URL)
+
+	var got1xx []int
+	var gotLink string
+	trace := &httptrace.ClientTrace{Got1xxResponse: func(code int, header textproto.MIMEHeader) error {
+		got1xx = append(got1xx, code)
+		gotLink = header.Get("Link")
+		return nil
+	}}
+	req, err := http.NewRequestWithContext(httptrace.WithClientTrace(context.Background(), trace), http.MethodGet, srv.URL, nil)
 	if err != nil {
 		t.Fatal(err)
+	}
+	res, err := c.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer res.Body.Close()
+	if len(got1xx) != 1 || got1xx[0] != http.StatusEarlyHints || gotLink != "</x.css>; rel=preload; as=style" {
+		t.Fatalf("103 not delivered to the client: codes=%v link=%q", got1xx, gotLink)
 	}
 	if !sawFinal || res.StatusCode != http.StatusTemporaryRedirect {
 		t.Fatalf("want 307 after a 103, got %d", res.StatusCode)
 	}
 	if res.Header.Get("Location") != "/login" {
 		t.Fatalf("Location lost: %q", res.Header.Get("Location"))
+	}
+}
+
+func TestInterceptor_101SwitchingProtocolsTakesFinalPath(t *testing.T) {
+	waf, err := coraza.NewWAF(coraza.NewWAFConfig().WithDirectives("SecRuleEngine On\nSecResponseBodyAccess Off"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	tx := waf.NewTransaction()
+	defer tx.Close()
+	rec := httptest.NewRecorder()
+	i := &rwInterceptor{w: rec, tx: tx, proto: "HTTP/1.1", statusCode: 200}
+	i.WriteHeader(http.StatusSwitchingProtocols)
+	if !i.wroteHeader || i.statusCode != http.StatusSwitchingProtocols {
+		t.Fatalf("101 must take the final-status path: wroteHeader=%v statusCode=%d", i.wroteHeader, i.statusCode)
+	}
+	if rec.Code != http.StatusOK { // not flushed yet: the final header is deferred exactly as upstream does
+		t.Fatalf("101 must not be forwarded early: recorder code=%d", rec.Code)
 	}
 }
