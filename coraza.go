@@ -4,7 +4,9 @@
 package coraza
 
 import (
+	"crypto/rand"
 	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -57,9 +59,11 @@ func (p *pooledWAF) Destruct() error {
 // corazaModule is a Web Application Firewall implementation for Caddy.
 type corazaModule struct {
 	// deprecated
-	Include      []string `json:"include"`
-	Directives   string   `json:"directives"`
-	LoadOWASPCRS bool     `json:"load_owasp_crs"`
+	Include              []string `json:"include"`
+	Directives           string   `json:"directives"`
+	LoadOWASPCRS         bool     `json:"load_owasp_crs"`
+	ManagedHeaderPrivacy bool     `json:"managed_header_privacy,omitempty"`
+	privacy              managedHeaderPrivacyBridge
 
 	logger  *zap.Logger
 	waf     coraza.WAF
@@ -77,6 +81,17 @@ func (corazaModule) CaddyModule() caddy.ModuleInfo {
 // Provision implements caddy.Provisioner.
 func (m *corazaModule) Provision(ctx caddy.Context) error {
 	m.logger = ctx.Logger(m)
+	if m.ManagedHeaderPrivacy {
+		module, err := caddy.GetModule("apx.coraza_privacy")
+		if err != nil {
+			return errors.New("managed Header privacy module unavailable")
+		}
+		var ok bool
+		m.privacy, ok = module.New().(managedHeaderPrivacyBridge)
+		if !ok {
+			return errors.New("invalid managed Header privacy bridge")
+		}
+	}
 	m.poolKey = m.computePoolKey()
 
 	val, loaded, err := wafPool.LoadOrNew(m.poolKey, func() (caddy.Destructor, error) {
@@ -99,9 +114,13 @@ func (m *corazaModule) Provision(ctx caddy.Context) error {
 
 // buildWAF creates a new coraza.WAF from the module's configuration.
 func (m *corazaModule) buildWAF() (coraza.WAF, error) {
-	config := coraza.NewWAFConfig().
-		WithErrorCallback(newErrorCb(m.logger)).
-		WithDebugLogger(newLogger(m.logger))
+	callback := newErrorCb(m.logger)
+	debugLogger := newLogger(m.logger)
+	if m.ManagedHeaderPrivacy {
+		callback = newErrorCb(m.logger, m.privacy)
+		debugLogger = newLogger(zap.NewNop())
+	}
+	config := coraza.NewWAFConfig().WithErrorCallback(callback).WithDebugLogger(debugLogger)
 
 	if m.LoadOWASPCRS {
 		config = config.WithRootFS(mergefs.Merge(coreruleset.FS, mergefsio.OSFS))
@@ -132,6 +151,9 @@ func (m *corazaModule) buildWAF() (coraza.WAF, error) {
 		}
 	}
 
+	if m.ManagedHeaderPrivacy {
+		config = config.WithDirectives(`SecComponentSignature "APX_MANAGED_HEADER_PRIVACY/1"`)
+	}
 	return coraza.NewWAF(config)
 }
 
@@ -141,6 +163,9 @@ func (m *corazaModule) buildWAF() (coraza.WAF, error) {
 func (m *corazaModule) computePoolKey() string {
 	h := sha256.New()
 	h.Write([]byte(m.Directives))
+	if m.ManagedHeaderPrivacy {
+		h.Write([]byte("managed-header-privacy/1"))
+	}
 	h.Write([]byte{0}) // separator
 
 	sorted := make([]string, len(m.Include))
@@ -173,19 +198,31 @@ var errInterruptionTriggered = errors.New("interruption triggered")
 // ServeHTTP implements caddyhttp.MiddlewareHandler.
 func (m corazaModule) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler) error {
 	id := randomString(16)
+	if m.ManagedHeaderPrivacy {
+		bytes := make([]byte, 32)
+		if _, err := rand.Read(bytes); err != nil {
+			return errors.New("WAF transaction identity unavailable")
+		}
+		id = hex.EncodeToString(bytes)
+	}
+	release := func() {}
+	if m.ManagedHeaderPrivacy && m.privacy != nil {
+		release = m.privacy.Bind(id, r)
+	}
+	defer release()
 	tx := m.waf.NewTransactionWithID(id)
 	defer func() {
-		tx.ProcessLogging()
 		if err := tx.Close(); err != nil {
-			m.logger.Warn("Failed to close the transaction", zap.String("tx_id", tx.ID()), zap.Error(err))
+			m.logger.Warn("Failed to close the transaction", zap.String("tx_id", tx.ID()), zap.String("error", m.privateText(id, err.Error())))
 		}
 	}()
+	defer tx.ProcessLogging()
 
 	// Early return, Coraza is not going to process any rule
 	if tx.IsRuleEngineOff() {
 		// response writer is not going to be wrapped, but used as-is
 		// to generate the response
-		return next.ServeHTTP(w, r)
+		return m.privateError(id, next.ServeHTTP(w, r))
 	}
 
 	repl := r.Context().Value(caddy.ReplacerCtxKey).(*caddy.Replacer)
@@ -201,13 +238,13 @@ func (m corazaModule) ServeHTTP(w http.ResponseWriter, r *http.Request, next cad
 		return caddyhttp.HandlerError{
 			StatusCode: http.StatusInternalServerError,
 			ID:         tx.ID(),
-			Err:        err,
+			Err:        m.privateError(id, err),
 		}
 	} else if it != nil {
 		m.logger.Error("WAF rule violation detected",
-			zap.String("hostname", r.Host),
-			zap.String("uri", r.RequestURI),
-			zap.String("client_ip", r.RemoteAddr),
+			zap.String("hostname", m.privateText(id, r.Host)),
+			zap.String("uri", m.privateText(id, r.RequestURI)),
+			zap.String("client_ip", m.privateText(id, r.RemoteAddr)),
 			zap.String("unique_id", tx.ID()),
 		)
 		return caddyhttp.HandlerError{
@@ -221,10 +258,10 @@ func (m corazaModule) ServeHTTP(w http.ResponseWriter, r *http.Request, next cad
 
 	// We continue with the other middlewares by catching the response
 	if err := next.ServeHTTP(ww, r); err != nil {
-		return err
+		return m.privateError(id, err)
 	}
 
-	return processResponse(tx, r)
+	return m.privateError(id, processResponse(tx, r))
 }
 
 // Unmarshal Caddyfile implements caddyfile.Unmarshaler.
@@ -274,9 +311,25 @@ func parseCaddyfile(h httpcaddyfile.Helper) (caddyhttp.MiddlewareHandler, error)
 	return m, err
 }
 
-func newErrorCb(logger *zap.Logger) func(types.MatchedRule) {
+func newErrorCb(logger *zap.Logger, privacy ...managedHeaderPrivacyBridge) func(types.MatchedRule) {
 	return func(mr types.MatchedRule) {
 		logMsg := mr.ErrorLog()
+		if len(privacy) > 0 {
+			if privacy[0] == nil {
+				logMsg = ""
+			} else {
+				id := mr.TransactionID()
+				sensitive := privacy[0].Redact(id, mr.Message()) != mr.Message() || privacy[0].Redact(id, mr.Data()) != mr.Data()
+				for _, match := range mr.MatchedDatas() {
+					sensitive = sensitive || privacy[0].Redact(id, match.Value()) != match.Value() || privacy[0].Redact(id, match.Message()) != match.Message() || privacy[0].Redact(id, match.Data()) != match.Data()
+				}
+				if sensitive {
+					logMsg = ""
+				} else {
+					logMsg = privacy[0].Redact(id, logMsg)
+				}
+			}
+		}
 		switch mr.Rule().Severity() {
 		case types.RuleSeverityEmergency,
 			types.RuleSeverityAlert,
@@ -295,6 +348,29 @@ func newErrorCb(logger *zap.Logger) func(types.MatchedRule) {
 			logger.Warn(logMsg)
 		}
 	}
+}
+
+// The bridge is discovered through Caddy to keep the connector independent of
+// the stats package. It is private state, never exemption authority.
+type managedHeaderPrivacyBridge interface {
+	Bind(string, *http.Request) func()
+	Redact(string, string) string
+}
+
+func (m corazaModule) privateText(id, text string) string {
+	if !m.ManagedHeaderPrivacy {
+		return text
+	}
+	if m.privacy == nil {
+		return ""
+	}
+	return m.privacy.Redact(id, text)
+}
+func (m corazaModule) privateError(id string, err error) error {
+	if err == nil || !m.ManagedHeaderPrivacy {
+		return err
+	}
+	return errors.New(m.privateText(id, err.Error()))
 }
 
 // Interface guards

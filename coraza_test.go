@@ -31,7 +31,19 @@ import (
 	"go.uber.org/zap/zaptest/observer"
 )
 
-const baseURL = "http://127.0.0.1:8080"
+var baseURL string
+
+// Isolate the retained integration fixture from unrelated local port8080 services.
+func nativeFixtureConfig(raw string, t *testing.T) string {
+	t.Helper()
+	if baseURL == "" {
+		ln, err := net.Listen("tcp", "127.0.0.1:0")
+		require.NoError(t, err)
+		baseURL = "http://" + ln.Addr().String()
+		require.NoError(t, ln.Close())
+	}
+	return strings.ReplaceAll(raw, ":8080", baseURL)
+}
 
 func TestPlugin(t *testing.T) {
 	tester := newTester("test.init.config", t)
@@ -50,7 +62,7 @@ func TestPluginReload(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to load configuration file %s: %s", configFile, err)
 	}
-	rawConfig := string(configContent)
+	rawConfig := nativeFixtureConfig(string(configContent), t)
 
 	rawConfig = strings.ReplaceAll(rawConfig, "test123", "test456")
 
@@ -223,7 +235,7 @@ func newTester(caddyfile string, t *testing.T) *caddytest.Tester {
 	tester := caddytest.NewTester(t)
 	configContent, err := os.ReadFile(caddyfile)
 	require.NoError(t, err)
-	tester.InitServer(string(configContent), "caddyfile")
+	tester.InitServer(nativeFixtureConfig(string(configContent), t), "caddyfile")
 	return tester
 }
 
