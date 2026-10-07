@@ -156,3 +156,70 @@ func TestManagedHeaderPrivacyOrdinaryAndDisabledErrorIdentity(t *testing.T) {
 		require.Nil(t, m.privateError("ordinary", nil))
 	}
 }
+
+type emptyPrivacyError struct{ cause error }
+
+func (e emptyPrivacyError) Error() string { return "" }
+func (e emptyPrivacyError) Unwrap() error { return e.cause }
+
+func TestManagedHeaderPrivacyEmptyOuterHandlerCause(t *testing.T) {
+	for _, status := range []int{403, 502} {
+		for _, nilCause := range []bool{false, true} {
+			for _, mode := range []struct {
+				enabled, masked bool
+			}{{true, true}, {true, false}, {false, true}} {
+				t.Run(fmt.Sprintf("status%d-nil%t-enabled%t-masked%t", status, nilCause, mode.enabled, mode.masked), func(t *testing.T) {
+					var cause error
+					if !nilCause {
+						cause = errors.New("empty-outer-private-key!")
+					}
+					handler := caddyhttp.HandlerError{StatusCode: status, ID: "empty-id", Trace: "empty-trace", Err: cause}
+					original := emptyPrivacyError{cause: handler}
+					waf, err := corazaWAF.NewWAF(corazaWAF.NewWAFConfig().WithDirectives("SecRuleEngine Off"))
+					require.NoError(t, err)
+					bridge := &testPrivacyBridge{secret: "absent-test-secret", maskAll: mode.masked}
+					m := corazaModule{ManagedHeaderPrivacy: mode.enabled, privacy: bridge, logger: zap.NewNop(), waf: waf}
+					actual := m.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest("GET", "/", nil), caddyhttp.HandlerFunc(func(http.ResponseWriter, *http.Request) error { return original }))
+					expectedBinds := 0
+					if mode.enabled {
+						expectedBinds = 1
+					}
+					require.Equal(t, expectedBinds, bridge.binds)
+					require.Equal(t, expectedBinds, bridge.releases)
+					require.True(t, actual != nil && actual.Error() == "", "empty outer representation changed")
+					_, direct := actual.(caddyhttp.HandlerError)
+					require.False(t, direct, "empty wrapped error gained direct Caddy dispatch")
+					var preserved caddyhttp.HandlerError
+					require.True(t, errors.As(actual, &preserved), "empty wrapper lost Caddy errors.As metadata")
+					require.Equal(t, status, preserved.StatusCode)
+					require.Equal(t, handler.ID, preserved.ID)
+					require.Equal(t, handler.Trace, preserved.Trace)
+					if mode.enabled && mode.masked {
+						if nilCause {
+							require.Nil(t, preserved.Err, "nil HandlerError cause changed")
+						} else {
+							require.True(t, preserved.Err != nil && preserved.Err.Error() == "", "empty outer error retained a sensitive HandlerError cause")
+							for inner := actual; inner != nil; inner = errors.Unwrap(inner) {
+								require.False(t, strings.Contains(inner.Error(), "empty-outer-private-key!"), "empty wrapper unwrap retained sensitive text")
+							}
+						}
+					} else {
+						require.True(t, actual == original, "ordinary or disabled empty wrapper identity changed")
+						require.True(t, preserved.Err == cause, "ordinary or disabled cause identity changed")
+						if cause != nil {
+							require.True(t, errors.Is(actual, cause), "ordinary or disabled errors.Is changed")
+						}
+					}
+					request := httptest.NewRequest("GET", "/", nil)
+					request = request.WithContext(context.WithValue(request.Context(), caddy.ReplacerCtxKey, caddy.NewReplacer()))
+					request = (*caddyhttp.HTTPErrorConfig)(nil).WithError(request, actual)
+					repl := request.Context().Value(caddy.ReplacerCtxKey).(*caddy.Replacer)
+					for _, key := range []string{"http.error.status_code", "http.error.id", "http.error.trace", "http.error.message"} {
+						_, present := repl.Get(key)
+						require.False(t, present, "empty wrapped error gained direct placeholders")
+					}
+				})
+			}
+		}
+	}
+}

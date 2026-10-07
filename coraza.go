@@ -371,7 +371,10 @@ func (m corazaModule) privateError(id string, err error) error {
 		return err
 	}
 	text := m.privateText(id, err.Error())
-	if text == err.Error() {
+	// An empty outer representation may still unwrap to a sensitive cause.
+	// Determine request masking independently before preserving that chain.
+	masking := m.privateText(id, "managed-header-error-privacy") == ""
+	if !masking && text == err.Error() {
 		return err
 	}
 	var handlerError caddyhttp.HandlerError
