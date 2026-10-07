@@ -1,7 +1,10 @@
 package coraza
 
 import (
+	"context"
 	"errors"
+	"fmt"
+	"github.com/caddyserver/caddy/v2"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -17,6 +20,7 @@ import (
 
 type testPrivacyBridge struct {
 	secret          string
+	maskAll         bool
 	binds, releases int
 }
 
@@ -25,18 +29,18 @@ func (b *testPrivacyBridge) Bind(string, *http.Request) func() {
 	return func() { b.releases++ }
 }
 func (b *testPrivacyBridge) Redact(_ string, text string) string {
-	if strings.Contains(text, b.secret) {
+	if b.maskAll || strings.Contains(text, b.secret) {
 		return ""
 	}
 	return text
 }
 
 func TestManagedHeaderPrivacyRawDataProtectsEscapedErrorOutput(t *testing.T) {
-	for _, secret := range []string{"accepted-key!", `accepted-"quote\slash!`} {
+	for _, secret := range []string{"accepted-key!", `accepted-"quote\slash!`, "accepted-encoded-key%21"} {
 		core, logs := observer.New(zapcore.DebugLevel)
-		bridge := &testPrivacyBridge{secret: secret}
+		bridge := &testPrivacyBridge{secret: secret, maskAll: true}
 		m := corazaModule{ManagedHeaderPrivacy: true, privacy: bridge, logger: zap.New(core), Directives: `SecRuleEngine DetectionOnly
-SecRule REQUEST_HEADERS:X-Key "@unconditionalMatch" "id:900005,phase:1,pass,log,msg:'managed %{MATCHED_VAR}',logdata:'%{MATCHED_VAR}'"`}
+SecRule REQUEST_HEADERS:X-Key "@validateByteRange 32,34,38,42-59,61,65-90,95,97-122" "id:920274,phase:1,block,t:none,t:urlDecodeUni,log,msg:'Invalid character in request headers (outside of very strict set)',logdata:'%{MATCHED_VAR_NAME}=%{MATCHED_VAR}'"`}
 		waf, err := m.buildWAF()
 		require.NoError(t, err)
 		tx := waf.NewTransactionWithID("private-error-test")
@@ -86,4 +90,69 @@ SecRule REQUEST_HEADERS:X-Key "@unconditionalMatch" "id:900006,phase:1,pass,nolo
 	tx.ProcessLogging()
 	require.NoError(t, tx.Close())
 	require.Zero(t, logs.Len(), "managed mode must not emit unbound debug payloads")
+}
+
+func TestManagedHeaderPrivacyPreservesHandlerError(t *testing.T) {
+	for _, status := range []int{403, 502} {
+		for _, wrapped := range []bool{false, true} {
+			original := caddyhttp.HandlerError{StatusCode: status, ID: "fixture-id", Trace: "fixture-trace", Err: errors.New("typed-private-key!")}
+			var downstream error = original
+			if wrapped {
+				downstream = fmt.Errorf("private wrapper: %w", original)
+			}
+			waf, err := corazaWAF.NewWAF(corazaWAF.NewWAFConfig().WithDirectives("SecRuleEngine Off"))
+			require.NoError(t, err)
+			bridge := &testPrivacyBridge{maskAll: true}
+			m := corazaModule{ManagedHeaderPrivacy: true, privacy: bridge, logger: zap.NewNop(), waf: waf}
+			actual := m.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest("GET", "/", nil), caddyhttp.HandlerFunc(func(http.ResponseWriter, *http.Request) error { return downstream }))
+			require.Equal(t, 1, bridge.binds)
+			require.Equal(t, 1, bridge.releases)
+			_, direct := actual.(caddyhttp.HandlerError)
+			require.Equal(t, !wrapped, direct, "direct versus wrapped Caddy dispatch changed")
+			var preserved caddyhttp.HandlerError
+			require.True(t, errors.As(actual, &preserved), "errors.As lost Caddy HandlerError")
+			require.Equal(t, status, preserved.StatusCode)
+			require.Equal(t, original.ID, preserved.ID)
+			require.Equal(t, original.Trace, preserved.Trace)
+			require.True(t, preserved.Err != nil && preserved.Err.Error() == "", "underlying error retained sensitive text")
+			for cause := actual; cause != nil; cause = errors.Unwrap(cause) {
+				require.False(t, strings.Contains(cause.Error(), "typed-private-key!"), "unwrap retained sensitive text")
+			}
+			request := httptest.NewRequest("GET", "/", nil)
+			request = request.WithContext(context.WithValue(request.Context(), caddy.ReplacerCtxKey, caddy.NewReplacer()))
+			request = (*caddyhttp.HTTPErrorConfig)(nil).WithError(request, actual)
+			repl := request.Context().Value(caddy.ReplacerCtxKey).(*caddy.Replacer)
+			code, present := repl.Get("http.error.status_code")
+			require.Equal(t, !wrapped, present, "wrapped placeholder presence changed")
+			if wrapped {
+				for _, key := range []string{"http.error.id", "http.error.trace", "http.error.message"} {
+					_, present := repl.Get(key)
+					require.False(t, present, "wrapped error gained direct placeholders")
+				}
+			} else {
+				require.Equal(t, status, code)
+				id, _ := repl.Get("http.error.id")
+				require.Equal(t, original.ID, id)
+				trace, _ := repl.Get("http.error.trace")
+				require.Equal(t, original.Trace, trace)
+				message, _ := repl.Get("http.error.message")
+				require.True(t, message == "", "error placeholder retained sensitive text")
+			}
+		}
+	}
+}
+
+func TestManagedHeaderPrivacyOrdinaryAndDisabledErrorIdentity(t *testing.T) {
+	sentinel := errors.New("ordinary cause")
+	for _, enabled := range []bool{false, true} {
+		m := corazaModule{ManagedHeaderPrivacy: enabled, privacy: &testPrivacyBridge{secret: "not-supplied-key!"}}
+		original := caddyhttp.HandlerError{StatusCode: 403, ID: "ordinary-id", Trace: "ordinary-trace", Err: sentinel}
+		actual := m.privateError("ordinary", original)
+		preserved, ok := actual.(caddyhttp.HandlerError)
+		require.True(t, ok && preserved == original, "ordinary HandlerError identity changed")
+		require.True(t, errors.Is(actual, sentinel), "ordinary cause semantics changed")
+		wrapped := fmt.Errorf("ordinary wrapper: %w", original)
+		require.True(t, m.privateError("ordinary", wrapped) == wrapped, "ordinary wrapped error identity changed")
+		require.Nil(t, m.privateError("ordinary", nil))
+	}
 }

@@ -370,8 +370,33 @@ func (m corazaModule) privateError(id string, err error) error {
 	if err == nil || !m.ManagedHeaderPrivacy {
 		return err
 	}
-	return errors.New(m.privateText(id, err.Error()))
+	text := m.privateText(id, err.Error())
+	if text == err.Error() {
+		return err
+	}
+	var handlerError caddyhttp.HandlerError
+	if errors.As(err, &handlerError) {
+		if handlerError.Err != nil {
+			handlerError.Err = errors.New(m.privateText(id, handlerError.Err.Error()))
+		}
+		if _, direct := err.(caddyhttp.HandlerError); direct {
+			return handlerError
+		}
+		return privateWrappedHandlerError{text: text, cause: handlerError}
+	}
+	return errors.New(text)
 }
+
+// Keep an originally wrapped HandlerError wrapped: Caddy dispatch uses
+// errors.As, while placeholder/fallback code deliberately checks the direct type.
+// Its only unwrap target is the sanitized copy, never the original error chain.
+type privateWrappedHandlerError struct {
+	text  string
+	cause caddyhttp.HandlerError
+}
+
+func (e privateWrappedHandlerError) Error() string { return e.text }
+func (e privateWrappedHandlerError) Unwrap() error { return e.cause }
 
 // Interface guards
 var (
