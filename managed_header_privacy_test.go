@@ -63,7 +63,8 @@ func TestManagedHeaderPrivacyDeferCleanupOnDownstreamAndCloseErrors(t *testing.T
 	require.Equal(t, 1, bridge.binds)
 	require.Equal(t, 1, bridge.releases)
 	require.Equal(t, 1, logs.Len())
-	require.Equal(t, "", logs.All()[0].ContextMap()["error"])
+	privateCloseError, ok := logs.All()[0].ContextMap()["error"].(string)
+	require.True(t, ok && privateCloseError == "", "close error text retained sensitive material")
 }
 
 func TestManagedHeaderPrivacyPoolAndDebugBoundary(t *testing.T) {
