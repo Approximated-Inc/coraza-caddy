@@ -4,16 +4,23 @@
 package coraza
 
 import (
+	"context"
 	"crypto/rand"
 	"crypto/sha256"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
+	"os"
 	"path/filepath"
+	"reflect"
 	"sort"
 	"strings"
+	"syscall"
 
 	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
@@ -380,7 +387,7 @@ func (m corazaModule) privateError(id string, err error) error {
 	var handlerError caddyhttp.HandlerError
 	if errors.As(err, &handlerError) {
 		if handlerError.Err != nil {
-			handlerError.Err = errors.New(m.privateText(id, handlerError.Err.Error()))
+			handlerError.Err = m.privateCause(id, handlerError.Err)
 		}
 		if _, direct := err.(caddyhttp.HandlerError); direct {
 			return handlerError
@@ -388,6 +395,81 @@ func (m corazaModule) privateError(id string, err error) error {
 		return privateWrappedHandlerError{text: text, cause: handlerError}
 	}
 	return errors.New(text)
+}
+
+// privateCause replaces a HandlerError cause with request-free text while
+// keeping the class that Caddy and apx-caddy-stats read (WAF interruption,
+// no upstream, typed transport failures). Only fixed sentinels or fresh
+// values without the original fields survive; never the original chain.
+func (m corazaModule) privateCause(id string, err error) error {
+	if safe := safeErrorClass(err); safe != nil {
+		return safe
+	}
+	return errors.New(m.privateText(id, err.Error()))
+}
+
+// Caddy's unexported errNoUpstream text; it carries no request data.
+const noUpstreamText = "no upstreams available"
+
+func safeErrorClass(err error) error {
+	var verification *tls.CertificateVerificationError
+	var authority x509.UnknownAuthorityError
+	var invalid x509.CertificateInvalidError
+	var hostname x509.HostnameError
+	var dns *net.DNSError
+	var op *net.OpError
+	switch {
+	case errors.Is(err, errInterruptionTriggered):
+		return errInterruptionTriggered
+	case err.Error() == noUpstreamText && errors.Unwrap(err) == nil:
+		// Keep identity: Caddy's retry logic uses errors.Is(errNoUpstream).
+		return err
+	case errors.Is(err, context.Canceled):
+		return context.Canceled
+	case retryableUpstreamResponse(err) != nil:
+		return retryableUpstreamResponse(err)
+	case errors.As(err, &verification) || errors.As(err, &authority) || errors.As(err, &invalid) || errors.As(err, &hostname):
+		return &tls.CertificateVerificationError{Err: errors.New("certificate verification failed")}
+	case errors.As(err, &dns):
+		return &net.DNSError{Err: "lookup failed", IsTimeout: dns.Timeout()}
+	case errors.Is(err, syscall.ECONNRESET):
+		return syscall.ECONNRESET
+	case errors.Is(err, io.ErrUnexpectedEOF):
+		return io.ErrUnexpectedEOF
+	case errors.Is(err, io.EOF):
+		return io.EOF
+	case err.Error() == responseHeaderTimeoutText:
+		return responseHeaderTimeout{}
+	case errors.As(err, &op) && op.Op == "write":
+		cause := error(syscall.EPIPE)
+		if op.Timeout() {
+			cause = os.ErrDeadlineExceeded
+		}
+		return &net.OpError{Op: "write", Net: "tcp", Err: cause}
+	}
+	return nil
+}
+
+// net/http exposes no sentinel for its response-header deadline.
+const responseHeaderTimeoutText = "net/http: timeout awaiting response headers"
+
+type responseHeaderTimeout struct{}
+
+func (responseHeaderTimeout) Error() string   { return responseHeaderTimeoutText }
+func (responseHeaderTimeout) Timeout() bool   { return true }
+func (responseHeaderTimeout) Temporary() bool { return true }
+
+// Caddy (2.11.3+) reports a retry_match response with an unexported type
+// whose text is a fixed format plus a status code. Keep that value so
+// callers can tell a retried upstream response from a transport failure.
+func retryableUpstreamResponse(err error) error {
+	for inner := err; inner != nil; inner = errors.Unwrap(inner) {
+		typ := reflect.TypeOf(inner)
+		if typ.PkgPath() == "github.com/caddyserver/caddy/v2/modules/caddyhttp/reverseproxy" && typ.Name() == "retryableResponseError" {
+			return inner
+		}
+	}
+	return nil
 }
 
 // Keep an originally wrapped HandlerError wrapped: Caddy dispatch uses
