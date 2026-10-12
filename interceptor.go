@@ -20,9 +20,27 @@ var errHijackAfterInterruption = errors.New("connection takeover refused: the WA
 
 // hijackerTracker records a successful connection takeover (e.g. a WebSocket
 // upgrade) and refuses it once the WAF has interrupted the transaction.
+// It hijacks through http.ResponseController, so the takeover also reaches a
+// Hijacker that sits behind Unwrap-only wrappers (Caddy's deferred `headers`
+// handler, for one).
 type hijackerTracker struct {
-	hijacker    http.Hijacker
+	inner       http.ResponseWriter
 	interceptor *rwInterceptor
+}
+
+// canHijack reports whether w, or a writer it wraps via Unwrap, can hijack.
+// It walks the chain in the same order as http.ResponseController.Hijack.
+func canHijack(w http.ResponseWriter) bool {
+	for {
+		switch t := w.(type) {
+		case http.Hijacker:
+			return true
+		case interface{ Unwrap() http.ResponseWriter }:
+			w = t.Unwrap()
+		default:
+			return false
+		}
+	}
 }
 
 func (h *hijackerTracker) Hijack() (net.Conn, *bufio.ReadWriter, error) {
@@ -31,7 +49,7 @@ func (h *hijackerTracker) Hijack() (net.Conn, *bufio.ReadWriter, error) {
 	if h.interceptor.tx.IsInterrupted() {
 		return nil, nil, errHijackAfterInterruption
 	}
-	conn, rw, err := h.hijacker.Hijack()
+	conn, rw, err := http.NewResponseController(h.inner).Hijack()
 	if err != nil {
 		return conn, rw, err
 	}
@@ -174,6 +192,12 @@ func (i *rwInterceptor) Header() http.Header {
 	return i.w.Header()
 }
 
+// Unwrap lets http.ResponseController reach the wrapped writer for the
+// features the interceptor does not implement (e.g. read/write deadlines).
+func (i *rwInterceptor) Unwrap() http.ResponseWriter {
+	return i.w
+}
+
 func (i *rwInterceptor) ReadFrom(r io.Reader) (n int64, err error) {
 	return io.Copy(struct{ io.Writer }{i}, r)
 }
@@ -235,6 +259,7 @@ type responseWriter interface {
 	http.ResponseWriter
 	io.ReaderFrom
 	http.Flusher
+	Unwrap() http.ResponseWriter
 }
 
 var _ responseWriter = (*rwInterceptor)(nil)
@@ -298,8 +323,8 @@ func wrap(w http.ResponseWriter, r *http.Request, tx types.Transaction) (
 	}
 
 	var (
-		hijacker, isHijacker = i.w.(http.Hijacker)
-		pusher, isPusher     = i.w.(http.Pusher)
+		isHijacker       = canHijack(i.w)
+		pusher, isPusher = i.w.(http.Pusher)
 	)
 
 	switch {
@@ -312,13 +337,13 @@ func wrap(w http.ResponseWriter, r *http.Request, tx types.Transaction) (
 		return struct {
 			responseWriter
 			http.Hijacker
-		}{i, &hijackerTracker{hijacker: hijacker, interceptor: i}}, responseProcessor
+		}{i, &hijackerTracker{inner: i.w, interceptor: i}}, responseProcessor
 	case isHijacker && isPusher:
 		return struct {
 			responseWriter
 			http.Hijacker
 			http.Pusher
-		}{i, &hijackerTracker{hijacker: hijacker, interceptor: i}, pusher}, responseProcessor
+		}{i, &hijackerTracker{inner: i.w, interceptor: i}, pusher}, responseProcessor
 	default:
 		return struct {
 			responseWriter

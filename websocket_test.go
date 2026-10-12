@@ -198,26 +198,38 @@ func freeTCPPort(t *testing.T) int {
 }
 
 // TestWebSocketUpgradeThroughWAF runs real Caddy (waf > encode >
-// reverse_proxy) in front of a WebSocket echo origin in both engine modes.
+// reverse_proxy) in front of a WebSocket echo origin in both engine modes,
+// with and without a deferred `header` op ahead of the WAF. The app puts one
+// on every Fly cluster (Alt-Svc: clear), and Caddy then hands the WAF a
+// writer that offers Unwrap but no Hijacker.
 func TestWebSocketUpgradeThroughWAF(t *testing.T) {
 	upstream := newWSUpstream(t)
 	for _, tc := range []struct {
 		name   string
+		slug   string // URL-safe, and never a prefix of another case's slug
 		engine string
 		block  bool
+		altSvc bool
 	}{
-		{"block", "On", true},
-		{"detect", "DetectionOnly", false},
+		{"block", "block", "On", true, false},
+		{"detect", "detect", "DetectionOnly", false, false},
+		{"block behind deferred Alt-Svc", "altsvc-block", "On", true, true},
+		{"detect behind deferred Alt-Svc", "altsvc-detect", "DetectionOnly", false, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			port := freeTCPPort(t)
+			altSvc := ""
+			if tc.altSvc {
+				altSvc = "header >Alt-Svc clear"
+			}
 			tester := caddytest.NewTester(t)
 			tester.InitServer(fmt.Sprintf(`{
 				admin localhost:%d
 				auto_https off
-				order coraza_waf first
 			}
 			:%d {
+				route {
+				%s
 				coraza_waf {
 					directives `+"`"+`
 						SecRuleEngine %s
@@ -230,11 +242,12 @@ func TestWebSocketUpgradeThroughWAF(t *testing.T) {
 				}
 				encode gzip
 				reverse_proxy %s
-			}`, caddytest.Default.AdminPort, port, tc.engine, upstream.Listener.Addr()), "caddyfile")
+				}
+			}`, caddytest.Default.AdminPort, port, altSvc, tc.engine, upstream.Listener.Addr()), "caddyfile")
 			addr := fmt.Sprintf("127.0.0.1:%d", port)
 
 			t.Run("clean upgrade switches protocols and echoes", func(t *testing.T) {
-				resp, conn, br, err := dialWSUpgrade(t, addr, "/ws?room=lobby-"+tc.name, nil)
+				resp, conn, br, err := dialWSUpgrade(t, addr, "/ws?room=lobby-"+tc.slug, nil)
 				requireWSEcho(t, resp, conn, br, err)
 			})
 
@@ -242,8 +255,8 @@ func TestWebSocketUpgradeThroughWAF(t *testing.T) {
 				name, marker, target string
 				extra                map[string]string
 			}{
-				{"xss in query", "atk=xss-" + tc.name, "/ws?atk=xss-" + tc.name + "&q=%3Cscript%3Ealert(document.cookie)%3C%2Fscript%3E", nil},
-				{"sqli in cookie", "atk=sqli-" + tc.name, "/ws?atk=sqli-" + tc.name, map[string]string{"Cookie": "session=1' UNION SELECT password FROM users--"}},
+				{"xss in query", "atk=xss-" + tc.slug, "/ws?atk=xss-" + tc.slug + "&q=%3Cscript%3Ealert(document.cookie)%3C%2Fscript%3E", nil},
+				{"sqli in cookie", "atk=sqli-" + tc.slug, "/ws?atk=sqli-" + tc.slug, map[string]string{"Cookie": "session=1' UNION SELECT password FROM users--"}},
 			} {
 				t.Run(attack.name, func(t *testing.T) {
 					resp, conn, br, err := dialWSUpgrade(t, addr, attack.target, attack.extra)
@@ -266,6 +279,9 @@ func TestWebSocketUpgradeThroughWAF(t *testing.T) {
 				require.NoError(t, err)
 				require.Equal(t, http.StatusOK, res.StatusCode)
 				require.Equal(t, "hello-http", string(body))
+				if tc.altSvc {
+					require.Equal(t, "clear", res.Header.Get("Alt-Svc"), "the deferred header op must be in the chain")
+				}
 			})
 
 			t.Run("103 early hints still precede the final status", func(t *testing.T) {
