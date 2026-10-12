@@ -185,6 +185,8 @@ func TestWrapPreservesInterfaces(t *testing.T) {
 		{"hijacker writer", hijackerResponseWriter{rec}, true, false},
 		{"pusher writer", pusherResponseWriter{rec}, false, true},
 		{"hijacker+pusher writer", hijackerPusherResponseWriter{rec}, true, true},
+		{"hijacker behind unwrap-only writer", unwrapOnlyWriter{hijackerResponseWriter{rec}}, true, false},
+		{"plain behind unwrap-only writer", unwrapOnlyWriter{plainResponseWriter{rec}}, false, false},
 	}
 
 	for _, tt := range tests {
@@ -204,6 +206,12 @@ func TestWrapPreservesInterfaces(t *testing.T) {
 			// All wrapped writers should implement Flusher
 			_, isFlusher := wrapped.(http.Flusher)
 			require.True(t, isFlusher)
+
+			// and unwrap to the writer they were given, so http.ResponseController
+			// features the interceptor does not implement reach through.
+			unwrapper, ok := wrapped.(interface{ Unwrap() http.ResponseWriter })
+			require.True(t, ok, "the wrapped writer must expose Unwrap")
+			require.Equal(t, tt.rw, unwrapper.Unwrap())
 		})
 	}
 }
@@ -651,20 +659,260 @@ func TestInterceptor_103EarlyHintsPassesThroughAndFinalStatusSurvives(t *testing
 	}
 }
 
-func TestInterceptor_101SwitchingProtocolsTakesFinalPath(t *testing.T) {
-	waf, err := coraza.NewWAF(coraza.NewWAFConfig().WithDirectives("SecRuleEngine On\nSecResponseBodyAccess Off"))
-	if err != nil {
-		t.Fatal(err)
+type upgradeOutcome struct {
+	hijackErr  error
+	processErr error
+}
+
+// serveUpgradeThroughInterceptor completes a protocol switch the way Caddy's
+// reverse_proxy does: copy the origin's headers, WriteHeader(101), then
+// Hijack through http.ResponseController and relay frames.
+// outer, when set, wraps the server's writer before the interceptor sees it,
+// standing in for a handler that runs ahead of the WAF.
+func serveUpgradeThroughInterceptor(t *testing.T, waf coraza.WAF, outer func(http.ResponseWriter) http.ResponseWriter) (string, <-chan upgradeOutcome) {
+	t.Helper()
+	outcomes := make(chan upgradeOutcome, 1)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		tx := waf.NewTransaction()
+		defer func() { _ = tx.Close() }()
+		if outer != nil {
+			w = outer(w)
+		}
+		ww, processResponse := wrap(w, r, tx)
+		ww.Header().Set("Upgrade", "websocket")
+		ww.Header().Set("Connection", "Upgrade")
+		ww.Header().Set("Sec-WebSocket-Accept", wsAccept(r.Header.Get("Sec-WebSocket-Key")))
+		ww.WriteHeader(http.StatusSwitchingProtocols)
+		var out upgradeOutcome
+		conn, brw, err := http.NewResponseController(ww).Hijack()
+		if out.hijackErr = err; err == nil {
+			echoWSFrames(conn, brw.Reader)
+			_ = conn.Close()
+		}
+		out.processErr = processResponse(tx, r)
+		outcomes <- out
+	}))
+	t.Cleanup(srv.Close)
+	return srv.Listener.Addr().String(), outcomes
+}
+
+// awaitUpgradeOutcome hangs up and waits for the handler to finish.
+func awaitUpgradeOutcome(t *testing.T, outcomes <-chan upgradeOutcome, conn net.Conn) upgradeOutcome {
+	t.Helper()
+	_ = conn.Close()
+	select {
+	case out := <-outcomes:
+		return out
+	case <-time.After(5 * time.Second):
+		t.Fatal("upgrade handler did not finish")
+		return upgradeOutcome{}
 	}
+}
+
+// unwrapOnlyWriter mirrors Caddy's deferred `headers` wrapper: it exposes the
+// writer it wraps through Unwrap but implements no Hijacker of its own.
+type unwrapOnlyWriter struct{ http.ResponseWriter }
+
+func (u unwrapOnlyWriter) Unwrap() http.ResponseWriter { return u.ResponseWriter }
+
+// writerChains are the writers the interceptor wraps: the server's own, and
+// the same behind a handler ahead of the WAF that only offers Unwrap.
+var writerChains = []struct {
+	name  string
+	outer func(http.ResponseWriter) http.ResponseWriter
+}{
+	{"direct", nil},
+	{"behind unwrap-only wrapper", func(w http.ResponseWriter) http.ResponseWriter { return unwrapOnlyWriter{w} }},
+}
+
+func TestInterceptor_SwitchingProtocolsReachesClientBeforeHijack(t *testing.T) {
+	for _, chain := range writerChains {
+		for _, engine := range []string{"On", "DetectionOnly"} {
+			t.Run(chain.name+"/"+engine, func(t *testing.T) {
+				waf := newWAF(t, "SecRuleEngine "+engine+"\nSecResponseBodyAccess On\nSecResponseBodyMimeType text/plain text/html")
+				addr, outcomes := serveUpgradeThroughInterceptor(t, waf, chain.outer)
+				resp, conn, br, err := dialWSUpgrade(t, addr, "/ws", nil)
+				requireWSEcho(t, resp, conn, br, err)
+				out := awaitUpgradeOutcome(t, outcomes, conn)
+				require.NoError(t, out.hijackErr)
+				require.NoError(t, out.processErr)
+			})
+		}
+	}
+}
+
+func TestInterceptor_ResponseHeaderDenyRefusesProtocolSwitch(t *testing.T) {
+	const rule = `SecRule RESPONSE_STATUS "@streq 101" "id:101,phase:3,deny,status:403,log"`
+
+	for _, chain := range writerChains {
+		t.Run(chain.name+"/block", func(t *testing.T) {
+			addr, outcomes := serveUpgradeThroughInterceptor(t, newWAF(t, "SecRuleEngine On\n"+rule), chain.outer)
+			resp, conn, _, err := dialWSUpgrade(t, addr, "/ws", nil)
+			require.NoError(t, err)
+			require.Equal(t, http.StatusForbidden, resp.StatusCode)
+			require.Empty(t, resp.Header.Get("Upgrade"), "a denied switch must not carry upgrade headers")
+			out := awaitUpgradeOutcome(t, outcomes, conn)
+			require.ErrorIs(t, out.hijackErr, errHijackAfterInterruption, "the raw connection must not be handed over after a deny")
+			require.NoError(t, out.processErr)
+		})
+
+		t.Run(chain.name+"/detect", func(t *testing.T) {
+			addr, outcomes := serveUpgradeThroughInterceptor(t, newWAF(t, "SecRuleEngine DetectionOnly\n"+rule), chain.outer)
+			resp, conn, br, err := dialWSUpgrade(t, addr, "/ws", nil)
+			requireWSEcho(t, resp, conn, br, err)
+			out := awaitUpgradeOutcome(t, outcomes, conn)
+			require.NoError(t, out.hijackErr)
+			require.NoError(t, out.processErr)
+		})
+	}
+}
+
+// hijackRecorder is a hijackable recorder that logs every status it is sent.
+type hijackRecorder struct {
+	*httptest.ResponseRecorder
+	codes []int
+}
+
+func (h *hijackRecorder) WriteHeader(code int) {
+	h.codes = append(h.codes, code)
+	h.ResponseRecorder.WriteHeader(code)
+}
+
+func (h *hijackRecorder) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	server, client := net.Pipe()
+	_ = client.Close()
+	return server, bufio.NewReadWriter(bufio.NewReader(server), bufio.NewWriter(server)), nil
+}
+
+func TestInterceptor_HijackedConnectionSkipsResponseProcessing(t *testing.T) {
+	waf := newWAF(t, `SecRuleEngine On
+SecResponseBodyAccess On
+SecResponseBodyMimeType text/plain
+SecRule RESPONSE_STATUS "@streq 101" "id:102,phase:4,deny,status:403,log"`)
 	tx := waf.NewTransaction()
+	defer func() { _ = tx.Close() }()
+	rec := &hijackRecorder{ResponseRecorder: httptest.NewRecorder()}
+	req := httptest.NewRequest(http.MethodGet, "/ws", nil)
+
+	ww, processResponse := wrap(rec, req, tx)
+	ww.Header().Set("Content-Type", "text/plain")
+	ww.WriteHeader(http.StatusSwitchingProtocols)
+	conn, _, err := http.NewResponseController(ww).Hijack()
+	require.NoError(t, err)
+	require.NoError(t, conn.Close())
+
+	require.NoError(t, processResponse(tx, req), "a hijacked connection has no body to inspect and cannot carry an error response")
+	require.Equal(t, []int{http.StatusSwitchingProtocols}, rec.codes)
+}
+
+// deadlineRecorder records write deadlines set through http.ResponseController.
+type deadlineRecorder struct {
+	*httptest.ResponseRecorder
+	deadline time.Time
+}
+
+func (d *deadlineRecorder) SetWriteDeadline(t time.Time) error {
+	d.deadline = t
+	return nil
+}
+
+func TestInterceptor_ResponseControllerReachesWrappedWriter(t *testing.T) {
+	tx := newTestTransaction(t)
 	defer tx.Close()
-	rec := httptest.NewRecorder()
-	i := &rwInterceptor{w: rec, tx: tx, proto: "HTTP/1.1", statusCode: 200}
-	i.WriteHeader(http.StatusSwitchingProtocols)
-	if !i.wroteHeader || i.statusCode != http.StatusSwitchingProtocols {
-		t.Fatalf("101 must take the final-status path: wroteHeader=%v statusCode=%d", i.wroteHeader, i.statusCode)
+	inner := &deadlineRecorder{ResponseRecorder: httptest.NewRecorder()}
+	ww, _ := wrap(unwrapOnlyWriter{inner}, httptest.NewRequest(http.MethodGet, "/", nil), tx)
+	deadline := time.Now().Add(time.Minute)
+	require.NoError(t, http.NewResponseController(ww).SetWriteDeadline(deadline))
+	require.True(t, deadline.Equal(inner.deadline))
+}
+
+// failingHijackRecorder refuses every takeover.
+type failingHijackRecorder struct{ *hijackRecorder }
+
+func (failingHijackRecorder) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	return nil, nil, http.ErrHijacked
+}
+
+func TestInterceptor_HijackThroughUnwrapChain(t *testing.T) {
+	newTx := func(t *testing.T) types.Transaction {
+		waf := newWAF(t, "SecRuleEngine On\nSecResponseBodyAccess Off")
+		tx := waf.NewTransaction()
+		t.Cleanup(func() { _ = tx.Close() })
+		return tx
 	}
-	if rec.Code != http.StatusOK { // not flushed yet: the final header is deferred exactly as upstream does
-		t.Fatalf("101 must not be forwarded early: recorder code=%d", rec.Code)
+	req := httptest.NewRequest(http.MethodGet, "/ws", nil)
+
+	t.Run("a successful takeover is tracked", func(t *testing.T) {
+		tx := newTx(t)
+		rec := &hijackRecorder{ResponseRecorder: httptest.NewRecorder()}
+		ww, processResponse := wrap(unwrapOnlyWriter{rec}, req, tx)
+		// No WriteHeader first: an untracked takeover would let response
+		// processing flush a 200 onto the hijacked connection.
+		conn, _, err := http.NewResponseController(ww).Hijack()
+		require.NoError(t, err)
+		require.NoError(t, conn.Close())
+		require.NoError(t, processResponse(tx, req))
+		require.Empty(t, rec.codes, "nothing may be written to a hijacked connection")
+	})
+
+	t.Run("a failed takeover is not", func(t *testing.T) {
+		tx := newTx(t)
+		rec := failingHijackRecorder{&hijackRecorder{ResponseRecorder: httptest.NewRecorder()}}
+		ww, processResponse := wrap(unwrapOnlyWriter{rec}, req, tx)
+		_, _, err := http.NewResponseController(ww).Hijack()
+		require.ErrorIs(t, err, http.ErrHijacked)
+		require.NoError(t, processResponse(tx, req))
+		require.Equal(t, []int{http.StatusOK}, rec.codes, "response processing must still flush the status")
+	})
+}
+
+// flushRecorder counts the flushes that reach it.
+type flushRecorder struct {
+	*httptest.ResponseRecorder
+	flushes int
+}
+
+func (f *flushRecorder) Flush() {
+	f.flushes++
+	f.ResponseRecorder.Flush()
+}
+
+func TestInterceptor_FlushThroughUnwrapChain(t *testing.T) {
+	newTx := func(t *testing.T) types.Transaction {
+		waf := newWAF(t, "SecRuleEngine On\nSecResponseBodyAccess Off")
+		tx := waf.NewTransaction()
+		t.Cleanup(func() { _ = tx.Close() })
+		return tx
 	}
+	req := httptest.NewRequest(http.MethodGet, "/events", nil)
+
+	for _, tc := range []struct {
+		name  string
+		outer func(http.ResponseWriter) http.ResponseWriter
+	}{
+		{"behind one unwrap-only wrapper", func(w http.ResponseWriter) http.ResponseWriter { return unwrapOnlyWriter{w} }},
+		{"behind two unwrap-only wrappers", func(w http.ResponseWriter) http.ResponseWriter { return unwrapOnlyWriter{unwrapOnlyWriter{w}} }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			tx := newTx(t)
+			rec := &flushRecorder{ResponseRecorder: httptest.NewRecorder()}
+			ww, _ := wrap(tc.outer(rec), req, tx)
+			ww.Header().Set("Content-Type", "text/event-stream")
+			_, err := ww.Write([]byte("data: one\n\n"))
+			require.NoError(t, err)
+
+			ww.(http.Flusher).Flush()
+			require.Equal(t, 1, rec.flushes, "a direct Flush must reach the flusher")
+			require.NoError(t, http.NewResponseController(ww).Flush())
+			require.Equal(t, 2, rec.flushes, "a ResponseController flush must reach the flusher")
+			require.Equal(t, http.StatusOK, rec.Code)
+			require.Equal(t, "data: one\n\n", rec.Body.String())
+		})
+	}
+
+	t.Run("no flusher anywhere is a silent no-op", func(t *testing.T) {
+		tx := newTx(t)
+		ww, _ := wrap(unwrapOnlyWriter{plainResponseWriter{httptest.NewRecorder()}}, req, tx)
+		require.NotPanics(t, func() { ww.(http.Flusher).Flush() })
+	})
 }

@@ -4,14 +4,58 @@
 package coraza
 
 import (
+	"bufio"
+	"errors"
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
 	"github.com/corazawaf/coraza/v3/types"
 )
+
+var errHijackAfterInterruption = errors.New("connection takeover refused: the WAF interrupted the response")
+
+// hijackerTracker records a successful connection takeover (e.g. a WebSocket
+// upgrade) and refuses it once the WAF has interrupted the transaction.
+// It hijacks through http.ResponseController, so the takeover also reaches a
+// Hijacker that sits behind Unwrap-only wrappers (Caddy's deferred `headers`
+// handler, for one).
+type hijackerTracker struct {
+	inner       http.ResponseWriter
+	interceptor *rwInterceptor
+}
+
+// canHijack reports whether w, or a writer it wraps via Unwrap, can hijack.
+// It walks the chain in the same order as http.ResponseController.Hijack.
+func canHijack(w http.ResponseWriter) bool {
+	for {
+		switch t := w.(type) {
+		case http.Hijacker:
+			return true
+		case interface{ Unwrap() http.ResponseWriter }:
+			w = t.Unwrap()
+		default:
+			return false
+		}
+	}
+}
+
+func (h *hijackerTracker) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	// A response-phase deny has already replaced the 101 with an error
+	// status. Handing over the raw connection would tunnel around it.
+	if h.interceptor.tx.IsInterrupted() {
+		return nil, nil, errHijackAfterInterruption
+	}
+	conn, rw, err := http.NewResponseController(h.inner).Hijack()
+	if err != nil {
+		return conn, rw, err
+	}
+	h.interceptor.isHijacked = true
+	return conn, rw, nil
+}
 
 // Copied from https://github.com/corazawaf/coraza/blob/main/http/interceptor.go
 // rwInterceptor intercepts the ResponseWriter, so it can track response size
@@ -24,6 +68,7 @@ type rwInterceptor struct {
 	isWriteHeaderFlush            bool
 	wroteHeader                   bool
 	wroteBufferedBodyToDownstream bool
+	isHijacked                    bool
 }
 
 // WriteHeader records the status code to be sent right before the moment
@@ -59,6 +104,12 @@ func (i *rwInterceptor) WriteHeader(statusCode int) {
 	}
 
 	i.wroteHeader = true
+
+	// A 101 has no body to inspect, and the caller hijacks the connection
+	// straight after this call, so the status must reach the client now.
+	if statusCode == http.StatusSwitchingProtocols {
+		i.flushWriteHeader()
+	}
 }
 
 // overrideWriteHeader overrides the recorded status code
@@ -141,6 +192,12 @@ func (i *rwInterceptor) Header() http.Header {
 	return i.w.Header()
 }
 
+// Unwrap lets http.ResponseController reach the wrapped writer for the
+// features the interceptor does not implement (e.g. read/write deadlines).
+func (i *rwInterceptor) Unwrap() http.ResponseWriter {
+	return i.w
+}
+
 func (i *rwInterceptor) ReadFrom(r io.Reader) (n int64, err error) {
 	return io.Copy(struct{ io.Writer }{i}, r)
 }
@@ -159,9 +216,11 @@ func (i *rwInterceptor) Flush() {
 	}
 
 	i.flushWriteHeader()
-	if flusher, ok := i.w.(http.Flusher); ok {
-		flusher.Flush()
-	}
+	// Through http.ResponseController, so the flush also reaches a Flusher
+	// behind Unwrap-only wrappers (Caddy's deferred `headers` handler, for
+	// one). Flush has no error to return; a writer chain that cannot flush
+	// stays a no-op, as before.
+	_ = http.NewResponseController(i.w).Flush()
 }
 
 func (i *rwInterceptor) writeBufferedResponseBodyToDownstream() error {
@@ -202,6 +261,7 @@ type responseWriter interface {
 	http.ResponseWriter
 	io.ReaderFrom
 	http.Flusher
+	Unwrap() http.ResponseWriter
 }
 
 var _ responseWriter = (*rwInterceptor)(nil)
@@ -219,6 +279,12 @@ func wrap(w http.ResponseWriter, r *http.Request, tx types.Transaction) (
 	i := &rwInterceptor{w: w, tx: tx, proto: r.Proto, statusCode: 200}
 
 	responseProcessor := func(tx types.Transaction, r *http.Request) error {
+		// A hijacked connection has no response body to inspect and can no
+		// longer carry a status or an error page.
+		if i.isHijacked {
+			return nil
+		}
+
 		// We look for interruptions triggered at phase 3 (response headers)
 		// and during writing the response body. If so, response status code
 		// has been sent over the flush already.
@@ -259,8 +325,8 @@ func wrap(w http.ResponseWriter, r *http.Request, tx types.Transaction) (
 	}
 
 	var (
-		hijacker, isHijacker = i.w.(http.Hijacker)
-		pusher, isPusher     = i.w.(http.Pusher)
+		isHijacker       = canHijack(i.w)
+		pusher, isPusher = i.w.(http.Pusher)
 	)
 
 	switch {
@@ -273,13 +339,13 @@ func wrap(w http.ResponseWriter, r *http.Request, tx types.Transaction) (
 		return struct {
 			responseWriter
 			http.Hijacker
-		}{i, hijacker}, responseProcessor
+		}{i, &hijackerTracker{inner: i.w, interceptor: i}}, responseProcessor
 	case isHijacker && isPusher:
 		return struct {
 			responseWriter
 			http.Hijacker
 			http.Pusher
-		}{i, hijacker, pusher}, responseProcessor
+		}{i, &hijackerTracker{inner: i.w, interceptor: i}, pusher}, responseProcessor
 	default:
 		return struct {
 			responseWriter
