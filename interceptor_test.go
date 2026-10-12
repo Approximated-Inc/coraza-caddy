@@ -651,20 +651,123 @@ func TestInterceptor_103EarlyHintsPassesThroughAndFinalStatusSurvives(t *testing
 	}
 }
 
-func TestInterceptor_101SwitchingProtocolsTakesFinalPath(t *testing.T) {
-	waf, err := coraza.NewWAF(coraza.NewWAFConfig().WithDirectives("SecRuleEngine On\nSecResponseBodyAccess Off"))
-	if err != nil {
-		t.Fatal(err)
+type upgradeOutcome struct {
+	hijackErr  error
+	processErr error
+}
+
+// serveUpgradeThroughInterceptor completes a protocol switch the way Caddy's
+// reverse_proxy does: copy the origin's headers, WriteHeader(101), then
+// Hijack through http.ResponseController and relay frames.
+func serveUpgradeThroughInterceptor(t *testing.T, waf coraza.WAF) (string, <-chan upgradeOutcome) {
+	t.Helper()
+	outcomes := make(chan upgradeOutcome, 1)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		tx := waf.NewTransaction()
+		defer func() { _ = tx.Close() }()
+		ww, processResponse := wrap(w, r, tx)
+		ww.Header().Set("Upgrade", "websocket")
+		ww.Header().Set("Connection", "Upgrade")
+		ww.Header().Set("Sec-WebSocket-Accept", wsAccept(r.Header.Get("Sec-WebSocket-Key")))
+		ww.WriteHeader(http.StatusSwitchingProtocols)
+		var out upgradeOutcome
+		conn, brw, err := http.NewResponseController(ww).Hijack()
+		if out.hijackErr = err; err == nil {
+			echoWSFrames(conn, brw.Reader)
+			_ = conn.Close()
+		}
+		out.processErr = processResponse(tx, r)
+		outcomes <- out
+	}))
+	t.Cleanup(srv.Close)
+	return srv.Listener.Addr().String(), outcomes
+}
+
+// awaitUpgradeOutcome hangs up and waits for the handler to finish.
+func awaitUpgradeOutcome(t *testing.T, outcomes <-chan upgradeOutcome, conn net.Conn) upgradeOutcome {
+	t.Helper()
+	_ = conn.Close()
+	select {
+	case out := <-outcomes:
+		return out
+	case <-time.After(5 * time.Second):
+		t.Fatal("upgrade handler did not finish")
+		return upgradeOutcome{}
 	}
+}
+
+func TestInterceptor_SwitchingProtocolsReachesClientBeforeHijack(t *testing.T) {
+	for _, engine := range []string{"On", "DetectionOnly"} {
+		t.Run(engine, func(t *testing.T) {
+			waf := newWAF(t, "SecRuleEngine "+engine+"\nSecResponseBodyAccess On\nSecResponseBodyMimeType text/plain text/html")
+			addr, outcomes := serveUpgradeThroughInterceptor(t, waf)
+			resp, conn, br, err := dialWSUpgrade(t, addr, "/ws", nil)
+			requireWSEcho(t, resp, conn, br, err)
+			out := awaitUpgradeOutcome(t, outcomes, conn)
+			require.NoError(t, out.hijackErr)
+			require.NoError(t, out.processErr)
+		})
+	}
+}
+
+func TestInterceptor_ResponseHeaderDenyRefusesProtocolSwitch(t *testing.T) {
+	const rule = `SecRule RESPONSE_STATUS "@streq 101" "id:101,phase:3,deny,status:403,log"`
+
+	t.Run("block", func(t *testing.T) {
+		addr, outcomes := serveUpgradeThroughInterceptor(t, newWAF(t, "SecRuleEngine On\n"+rule))
+		resp, conn, _, err := dialWSUpgrade(t, addr, "/ws", nil)
+		require.NoError(t, err)
+		require.Equal(t, http.StatusForbidden, resp.StatusCode)
+		require.Empty(t, resp.Header.Get("Upgrade"), "a denied switch must not carry upgrade headers")
+		out := awaitUpgradeOutcome(t, outcomes, conn)
+		require.Error(t, out.hijackErr, "the raw connection must not be handed over after a deny")
+		require.NoError(t, out.processErr)
+	})
+
+	t.Run("detect", func(t *testing.T) {
+		addr, outcomes := serveUpgradeThroughInterceptor(t, newWAF(t, "SecRuleEngine DetectionOnly\n"+rule))
+		resp, conn, br, err := dialWSUpgrade(t, addr, "/ws", nil)
+		requireWSEcho(t, resp, conn, br, err)
+		out := awaitUpgradeOutcome(t, outcomes, conn)
+		require.NoError(t, out.hijackErr)
+		require.NoError(t, out.processErr)
+	})
+}
+
+// hijackRecorder is a hijackable recorder that logs every status it is sent.
+type hijackRecorder struct {
+	*httptest.ResponseRecorder
+	codes []int
+}
+
+func (h *hijackRecorder) WriteHeader(code int) {
+	h.codes = append(h.codes, code)
+	h.ResponseRecorder.WriteHeader(code)
+}
+
+func (h *hijackRecorder) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	server, client := net.Pipe()
+	_ = client.Close()
+	return server, bufio.NewReadWriter(bufio.NewReader(server), bufio.NewWriter(server)), nil
+}
+
+func TestInterceptor_HijackedConnectionSkipsResponseProcessing(t *testing.T) {
+	waf := newWAF(t, `SecRuleEngine On
+SecResponseBodyAccess On
+SecResponseBodyMimeType text/plain
+SecRule RESPONSE_STATUS "@streq 101" "id:102,phase:4,deny,status:403,log"`)
 	tx := waf.NewTransaction()
-	defer tx.Close()
-	rec := httptest.NewRecorder()
-	i := &rwInterceptor{w: rec, tx: tx, proto: "HTTP/1.1", statusCode: 200}
-	i.WriteHeader(http.StatusSwitchingProtocols)
-	if !i.wroteHeader || i.statusCode != http.StatusSwitchingProtocols {
-		t.Fatalf("101 must take the final-status path: wroteHeader=%v statusCode=%d", i.wroteHeader, i.statusCode)
-	}
-	if rec.Code != http.StatusOK { // not flushed yet: the final header is deferred exactly as upstream does
-		t.Fatalf("101 must not be forwarded early: recorder code=%d", rec.Code)
-	}
+	defer func() { _ = tx.Close() }()
+	rec := &hijackRecorder{ResponseRecorder: httptest.NewRecorder()}
+	req := httptest.NewRequest(http.MethodGet, "/ws", nil)
+
+	ww, processResponse := wrap(rec, req, tx)
+	ww.Header().Set("Content-Type", "text/plain")
+	ww.WriteHeader(http.StatusSwitchingProtocols)
+	conn, _, err := http.NewResponseController(ww).Hijack()
+	require.NoError(t, err)
+	require.NoError(t, conn.Close())
+
+	require.NoError(t, processResponse(tx, req), "a hijacked connection has no body to inspect and cannot carry an error response")
+	require.Equal(t, []int{http.StatusSwitchingProtocols}, rec.codes)
 }
