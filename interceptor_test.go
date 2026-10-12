@@ -846,12 +846,13 @@ func TestInterceptor_HijackThroughUnwrapChain(t *testing.T) {
 		tx := newTx(t)
 		rec := &hijackRecorder{ResponseRecorder: httptest.NewRecorder()}
 		ww, processResponse := wrap(unwrapOnlyWriter{rec}, req, tx)
-		ww.WriteHeader(http.StatusSwitchingProtocols)
+		// No WriteHeader first: an untracked takeover would let response
+		// processing flush a 200 onto the hijacked connection.
 		conn, _, err := http.NewResponseController(ww).Hijack()
 		require.NoError(t, err)
 		require.NoError(t, conn.Close())
 		require.NoError(t, processResponse(tx, req))
-		require.Equal(t, []int{http.StatusSwitchingProtocols}, rec.codes)
+		require.Empty(t, rec.codes, "nothing may be written to a hijacked connection")
 	})
 
 	t.Run("a failed takeover is not", func(t *testing.T) {
@@ -862,5 +863,56 @@ func TestInterceptor_HijackThroughUnwrapChain(t *testing.T) {
 		require.ErrorIs(t, err, http.ErrHijacked)
 		require.NoError(t, processResponse(tx, req))
 		require.Equal(t, []int{http.StatusOK}, rec.codes, "response processing must still flush the status")
+	})
+}
+
+// flushRecorder counts the flushes that reach it.
+type flushRecorder struct {
+	*httptest.ResponseRecorder
+	flushes int
+}
+
+func (f *flushRecorder) Flush() {
+	f.flushes++
+	f.ResponseRecorder.Flush()
+}
+
+func TestInterceptor_FlushThroughUnwrapChain(t *testing.T) {
+	newTx := func(t *testing.T) types.Transaction {
+		waf := newWAF(t, "SecRuleEngine On\nSecResponseBodyAccess Off")
+		tx := waf.NewTransaction()
+		t.Cleanup(func() { _ = tx.Close() })
+		return tx
+	}
+	req := httptest.NewRequest(http.MethodGet, "/events", nil)
+
+	for _, tc := range []struct {
+		name  string
+		outer func(http.ResponseWriter) http.ResponseWriter
+	}{
+		{"behind one unwrap-only wrapper", func(w http.ResponseWriter) http.ResponseWriter { return unwrapOnlyWriter{w} }},
+		{"behind two unwrap-only wrappers", func(w http.ResponseWriter) http.ResponseWriter { return unwrapOnlyWriter{unwrapOnlyWriter{w}} }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			tx := newTx(t)
+			rec := &flushRecorder{ResponseRecorder: httptest.NewRecorder()}
+			ww, _ := wrap(tc.outer(rec), req, tx)
+			ww.Header().Set("Content-Type", "text/event-stream")
+			_, err := ww.Write([]byte("data: one\n\n"))
+			require.NoError(t, err)
+
+			ww.(http.Flusher).Flush()
+			require.Equal(t, 1, rec.flushes, "a direct Flush must reach the flusher")
+			require.NoError(t, http.NewResponseController(ww).Flush())
+			require.Equal(t, 2, rec.flushes, "a ResponseController flush must reach the flusher")
+			require.Equal(t, http.StatusOK, rec.Code)
+			require.Equal(t, "data: one\n\n", rec.Body.String())
+		})
+	}
+
+	t.Run("no flusher anywhere is a silent no-op", func(t *testing.T) {
+		tx := newTx(t)
+		ww, _ := wrap(unwrapOnlyWriter{plainResponseWriter{httptest.NewRecorder()}}, req, tx)
+		require.NotPanics(t, func() { ww.(http.Flusher).Flush() })
 	})
 }

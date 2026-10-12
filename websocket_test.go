@@ -99,7 +99,7 @@ func echoWSFrames(conn net.Conn, r *bufio.Reader) {
 }
 
 // wsUpstream is a minimal origin: a WebSocket echo endpoint, a 103 Early
-// Hints page and a plain page. It records every request URI it receives.
+// Hints page, an event stream and a plain page. It records every request URI it receives.
 type wsUpstream struct {
 	*httptest.Server
 	mu   sync.Mutex
@@ -124,6 +124,17 @@ func (u *wsUpstream) serve(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusEarlyHints)
 		w.Header().Set("Location", "/login")
 		w.WriteHeader(http.StatusTemporaryRedirect)
+	case r.URL.Path == "/sse":
+		// One event, flushed, then nothing until the client leaves or 2s
+		// pass: a dropped flush holds the first event back that long.
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "data: one\n\n")
+		_ = http.NewResponseController(w).Flush()
+		select {
+		case <-r.Context().Done():
+		case <-time.After(2 * time.Second):
+			_, _ = io.WriteString(w, "data: two\n\n")
+		}
 	case strings.EqualFold(r.Header.Get("Upgrade"), "websocket"):
 		conn, brw, err := http.NewResponseController(w).Hijack()
 		if err != nil {
@@ -281,6 +292,39 @@ func TestWebSocketUpgradeThroughWAF(t *testing.T) {
 				require.Equal(t, "hello-http", string(body))
 				if tc.altSvc {
 					require.Equal(t, "clear", res.Header.Get("Alt-Svc"), "the deferred header op must be in the chain")
+				}
+			})
+
+			t.Run("streamed events are flushed as they are written", func(t *testing.T) {
+				ctx, cancel := context.WithCancel(context.Background())
+				defer cancel()
+				type result struct {
+					line string
+					err  error
+				}
+				got := make(chan result, 1)
+				go func() {
+					req, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://"+addr+"/sse", nil)
+					if err != nil {
+						got <- result{err: err}
+						return
+					}
+					req.Header.Set("Accept", "text/event-stream")
+					res, err := http.DefaultClient.Do(req)
+					if err != nil {
+						got <- result{err: err}
+						return
+					}
+					defer res.Body.Close()
+					line, err := bufio.NewReader(res.Body).ReadString('\n')
+					got <- result{line, err}
+				}()
+				select {
+				case r := <-got:
+					require.NoError(t, r.err)
+					require.Equal(t, "data: one\n", r.line)
+				case <-time.After(500 * time.Millisecond):
+					t.Fatal("the first event did not arrive within 500ms; the origin's flush was dropped")
 				}
 			})
 

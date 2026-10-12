@@ -216,9 +216,11 @@ func (i *rwInterceptor) Flush() {
 	}
 
 	i.flushWriteHeader()
-	if flusher, ok := i.w.(http.Flusher); ok {
-		flusher.Flush()
-	}
+	// Through http.ResponseController, so the flush also reaches a Flusher
+	// behind Unwrap-only wrappers (Caddy's deferred `headers` handler, for
+	// one). Flush has no error to return; a writer chain that cannot flush
+	// stays a no-op, as before.
+	_ = http.NewResponseController(i.w).Flush()
 }
 
 func (i *rwInterceptor) writeBufferedResponseBodyToDownstream() error {
